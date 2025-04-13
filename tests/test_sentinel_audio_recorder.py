@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
 from fastapi.testclient import TestClient
-from sentinel_audio_recorder.api import app
+from sentinel_audio_recorder.run_api import app
 from sentinel_audio_recorder import api
 import tempfile
 

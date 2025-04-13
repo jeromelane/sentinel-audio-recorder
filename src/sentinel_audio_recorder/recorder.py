@@ -1,7 +1,6 @@
 import pyaudio
 import wave
 import os
-import time
 import logging
 import numpy as np
 from datetime import datetime

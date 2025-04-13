@@ -20,19 +20,18 @@ pip install -e .
 mkdir -p recordings
 
 echo -e "\033[1;34m🛠️  Installing systemd service...\033[0m"
-sudo cp system/sentinel-audio-recorder.service /etc/systemd/system/
 
 # Set env variable pointing to current install path
 cat <<EOF | sudo tee /etc/systemd/system/sentinel-audio-recorder.service
 [Unit]
-Description=sentinel-audio-recorder API server
+Description=Start noise-triggered recording on boot and API server
 After=network.target
 
 [Service]
 Environment=ALSA_LOG_LEVEL=none
-ExecStart=$(pwd)/.venv/bin/python $(pwd)/src/audio_recorder/run_api.py
+ExecStart=$(pwd)/.venv/bin/python $(pwd)/src/sentinel_audio_recorder/run_api.py
 WorkingDirectory=$(pwd)
-Restart=on-failure
+Restart=always
 User=$USER
 Group=$USER
 StandardOutput=journal
