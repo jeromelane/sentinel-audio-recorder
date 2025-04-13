@@ -24,13 +24,13 @@ cd sentinel-audio-recorder
 ./setup.sh
 ```
 
-To test api for remote download of recordings:
+To test api for remote services:
 
 ```bash
 curl http://localhost:8000/
 ```
 
-To test recordings:
+To test command line recording:
 
 ```bash
 sentinel-audio-recorder start --duration 60
@@ -42,7 +42,6 @@ sentinel-audio-recorder start --duration 60
 ## 🖥️ CLI Usage
 
 ```bash
-# Record for 5 minutes
 sentinel-audio-recorder start
 
 # Record in a 10-min rolling loop
