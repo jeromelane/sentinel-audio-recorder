@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sentinel-audio-recorder"
+version = "0.1.0"
+description = "Audio recording CLI with USB input"
+authors = [{ name = "Jerome Lane", email = "jerome.lane@hotmail.com" }]
+dependencies = ["pyaudio", "click", "pytest", "requests", "fastapi", "uvicorn", "httpx", "numpy"]
+requires-python = ">=3.7"
+
+[project.scripts]
+sentinel-audio-recorder = "sentinel_audio_recorder.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
