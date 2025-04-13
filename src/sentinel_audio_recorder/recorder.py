@@ -19,8 +19,8 @@ class Recorder:
         output_dir="recordings",
         loop=False,
         trigger=False,
-        threshold=600,
-        silence_timeout=5
+        threshold=1500,
+        silence_timeout=20
     ):
         self.p = pyaudio.PyAudio()
         self.card_index = self._discover_card_index(card_index)
@@ -34,9 +34,22 @@ class Recorder:
         self.CHUNK = 1024
         self.FORMAT = pyaudio.paInt16
         self.CHANNELS = 2
-        self.RATE = 44100
+        self.RATE = self._detect_sample_rate(self.card_index)
 
         os.makedirs(self.output_dir, exist_ok=True)
+
+    def _detect_sample_rate(self, card_index):
+        for rate in [48000, 44100, 32000, 16000, 8000]:
+            try:
+                self.p.is_format_supported(rate,
+                                          input_device=card_index,
+                                          input_channels= self.CHANNELS,
+                                          input_format=pyaudio.paInt16)
+                logging.info(f"✅ Detected sample rate: {rate} Hz")
+                return rate
+            except ValueError:
+                continue
+        raise ValueError("❌ No supported sample rate found for the device.")
 
     def _generate_filename(self):
         return os.path.join(
