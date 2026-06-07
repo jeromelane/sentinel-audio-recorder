@@ -1,6 +1,6 @@
 # sentinel-audio-recorder 🎙️
 
-**sentinel-audio-recorder** is a Raspberry Pi-based audio recording system that captures audio from a USB device on boot. It provides a simple CLI to start and stop recordings and is designed for future integration with remote services for transcription, annotation, and smart search.
+**sentinel-audio-recorder** is a Raspberry Pi-based audio recording system that captures audio from a USB device on boot. It provides a simple CLI to start recordings, exposes a small API, and can continuously upload completed recordings to a remote analyser backend for backup and processing.
 
 ---
 
@@ -11,6 +11,9 @@
 - 📦 Automatic virtual environment and dependency setup
 - 🔁 Records on boot using `systemd`
 - 🧪 Easy-to-use CLI for starting/stopping recordings
+- 🌐 Uploads completed recordings to a remote HTTP analyser backend
+- 💾 Tracks upload state in a small local SQLite ledger
+- 🧹 Cleans local storage when disk usage reaches the configured limit
 
 ---
 
@@ -37,6 +40,19 @@ sentinel-audio-recorder start --duration 60
 
 ```
 
+To sync recordings to a remote analyser backend:
+
+```bash
+export SENTINEL_UPLOAD_URL="http://SERVER:8080/ingest-audio/"
+sentinel-audio-recorder sync --once
+```
+
+Use continuous sync to keep uploading and cleaning storage in the background:
+
+```bash
+sentinel-audio-recorder sync --watch
+```
+
 ---
 
 ## 🖥️ CLI Usage
@@ -53,6 +69,77 @@ sentinel-audio-recorder start --trigger
 # Triggered recording with custom silence timeout
 sentinel-audio-recorder start --trigger --threshold 500 --silence-timeout 10
 
+# Run one upload/cleanup pass
+sentinel-audio-recorder sync --once
+
+# Continuously upload and clean local cache
+sentinel-audio-recorder sync --watch
+
 ```
 
-Recordings are saved in `recordings/` and can be downloaded remotely.
+Recordings are saved in `recordings/` and can be downloaded remotely while they are still present locally.
+
+---
+
+## 🔁 Upload Sync
+
+Upload sync scans `recordings/*.wav` from the filesystem, then uses a local SQLite ledger at `recordings/.upload_state.sqlite` to track upload, retry, and cleanup state.
+
+Each sync pass:
+
+1. Finds completed `.wav` files in `recordings/`.
+2. Uploads eligible files to `SENTINEL_UPLOAD_URL`.
+3. Marks successful uploads as `uploaded`.
+4. Records failed uploads and retries them later with backoff.
+5. Checks local disk usage.
+6. Cleans local files only if storage is at or above the configured high-watermark.
+
+Uploaded files are **not deleted immediately**. They remain as a local cache until storage cleanup is needed.
+
+### Storage Cleanup
+
+Cleanup starts when disk usage reaches `SENTINEL_STORAGE_HIGH_WATERMARK`, default `80`.
+
+When cleanup runs:
+
+1. Delete local WAV files smaller than `SENTINEL_SMALL_RECORDING_BYTES`, default `3984588` bytes, about `3.8 MiB`.
+2. If disk usage is still above the high-watermark, delete the oldest local WAV files that have already been uploaded.
+3. Larger unuploaded recordings are preserved.
+
+Deleted file history is kept in the SQLite ledger for `SENTINEL_DELETED_RETENTION_DAYS`, default `30`.
+
+### Configuration
+
+`setup.sh` creates a local `.env` file from `.env.default` if `.env` does not already exist. Edit `.env` with real values for your deployment. The installed systemd service loads this file automatically.
+
+```bash
+# Required to enable upload
+SENTINEL_UPLOAD_URL=http://SERVER:8080/ingest-audio/
+
+# Optional bearer token
+SENTINEL_UPLOAD_TOKEN=token
+
+# Optional tuning
+SENTINEL_RECORDINGS_DIR=recordings
+SENTINEL_UPLOAD_INTERVAL=30
+SENTINEL_UPLOAD_TIMEOUT=60
+SENTINEL_UPLOAD_MIN_AGE=10
+SENTINEL_UPLOAD_RETRY_BASE=30
+SENTINEL_UPLOAD_MAX_BACKOFF=3600
+SENTINEL_STORAGE_HIGH_WATERMARK=80
+SENTINEL_SMALL_RECORDING_BYTES=3984588
+SENTINEL_DELETED_RETENTION_DAYS=30
+```
+
+---
+
+## 🌐 API
+
+```bash
+curl http://localhost:8000/
+curl http://localhost:8000/list-recordings
+curl http://localhost:8000/download-last
+curl http://localhost:8000/sync-status
+```
+
+`/sync-status` reports upload configuration, filesystem WAV counts, ledger counts, disk usage, last upload error, and recent cleanup actions.

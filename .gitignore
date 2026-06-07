@@ -174,3 +174,4 @@ cython_debug/
 .pypirc
 
 *.wav
+recordings/.upload_state.sqlite

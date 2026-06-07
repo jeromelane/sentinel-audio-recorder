@@ -19,16 +19,24 @@ pip install -e .
 # Ensure recordings directory exists
 mkdir -p recordings
 
+if [ ! -f .env ]; then
+    echo -e "\033[1;34m🧾 Creating .env from .env.default...\033[0m"
+    cp .env.default .env
+    echo -e "\033[1;33m⚠️  Edit .env and set SENTINEL_UPLOAD_URL to enable upload sync.\033[0m"
+fi
+
 echo -e "\033[1;34m🛠️  Installing systemd service...\033[0m"
 
 # Set env variable pointing to current install path
 cat <<EOF | sudo tee /etc/systemd/system/sentinel-audio-recorder.service
 [Unit]
 Description=Start noise-triggered recording on boot and API server
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Environment=ALSA_LOG_LEVEL=none
+EnvironmentFile=-$(pwd)/.env
 ExecStart=$(pwd)/.venv/bin/python $(pwd)/src/sentinel_audio_recorder/run_api.py
 WorkingDirectory=$(pwd)
 Restart=always
@@ -48,3 +56,4 @@ sudo systemctl start sentinel-audio-recorder
 
 echo -e "\033[1;32m✅ Setup complete! API is running.\033[0m"
 echo -e "\033[1;32m🧪 Test it: curl http://localhost:8000/\033[0m"
+echo -e "\033[1;32m🔁 Upload sync runs automatically when SENTINEL_UPLOAD_URL is set in .env.\033[0m"
