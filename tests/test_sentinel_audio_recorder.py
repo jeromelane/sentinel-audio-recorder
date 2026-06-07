@@ -1,12 +1,29 @@
 import pytest
 from pathlib import Path
 from sentinel_audio_recorder import api
+from sentinel_audio_recorder.env import load_env_file
+from sentinel_audio_recorder.recorder import Recorder
 from sentinel_audio_recorder.uploader import RecordingUploader, UploadConfig
 import tempfile
 import time
 import os
 import sqlite3
 from collections import namedtuple
+
+
+class FakePyAudio:
+    def __init__(self, device_info, supported_formats):
+        self.device_info = device_info
+        self.supported_formats = supported_formats
+
+    def get_device_info_by_index(self, index):
+        return self.device_info
+
+    def is_format_supported(self, rate, input_device, input_channels, input_format):
+        if (rate, input_channels) not in self.supported_formats:
+            raise ValueError("unsupported")
+        return True
+
 
 @pytest.fixture
 def temp_recordings_dir(monkeypatch):
@@ -39,6 +56,55 @@ def test_download_last_with_fake_file(temp_recordings_dir):
     response = api.download_last()
     assert response.status_code == 200
     assert response.media_type == "audio/wav"
+
+
+def test_detect_audio_settings_prefers_device_default_rate():
+    recorder = Recorder.__new__(Recorder)
+    recorder.p = FakePyAudio(
+        {"maxInputChannels": 2, "defaultSampleRate": 96000.0},
+        {(96000, 2)},
+    )
+
+    rate, channels = recorder._detect_audio_settings(1)
+
+    assert rate == 96000
+    assert channels == 2
+
+
+def test_detect_audio_settings_falls_back_to_mono():
+    recorder = Recorder.__new__(Recorder)
+    recorder.p = FakePyAudio(
+        {"maxInputChannels": 2, "defaultSampleRate": 48000.0},
+        {(48000, 1)},
+    )
+
+    rate, channels = recorder._detect_audio_settings(1)
+
+    assert rate == 48000
+    assert channels == 1
+
+
+def test_env_int_ignores_invalid_values(monkeypatch):
+    recorder = Recorder.__new__(Recorder)
+    monkeypatch.setenv("SENTINEL_AUDIO_CHANNELS", "nope")
+
+    assert recorder._env_int("SENTINEL_AUDIO_CHANNELS", 2) == 2
+
+
+def test_load_env_file_sets_missing_values_only(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "SENTINEL_UPLOAD_URL=http://example.test/ingest-audio/\n"
+        "EXISTING=value-from-file\n"
+        "# ignored comment\n"
+    )
+    monkeypatch.delenv("SENTINEL_UPLOAD_URL", raising=False)
+    monkeypatch.setenv("EXISTING", "already-set")
+
+    load_env_file(env_file)
+
+    assert os.environ["SENTINEL_UPLOAD_URL"] == "http://example.test/ingest-audio/"
+    assert os.environ["EXISTING"] == "already-set"
 
 
 class FakeResponse:

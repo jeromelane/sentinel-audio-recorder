@@ -14,18 +14,21 @@ logging.basicConfig(
 class Recorder:
     def __init__(
         self,
-        card_index=1,
+        card_index=None,
         duration=3600,
-        output_dir="recordings",
+        output_dir=None,
         loop=False,
         trigger=False,
         threshold=1500,
-        silence_timeout=20
+        silence_timeout=20,
+        sample_rate=None,
+        channels=None
     ):
         self.p = pyaudio.PyAudio()
+        card_index = self._env_int("SENTINEL_AUDIO_CARD_INDEX", card_index)
         self.card_index = self._discover_card_index(card_index)
         self.duration = duration
-        self.output_dir = output_dir
+        self.output_dir = output_dir or os.getenv("SENTINEL_RECORDINGS_DIR", "recordings")
         self.loop = loop
         self.trigger = trigger
         self.threshold = threshold
@@ -33,23 +36,66 @@ class Recorder:
 
         self.CHUNK = 1024
         self.FORMAT = pyaudio.paInt16
-        self.CHANNELS = 2
-        self.RATE = self._detect_sample_rate(self.card_index)
+        requested_rate = self._env_int("SENTINEL_AUDIO_SAMPLE_RATE", sample_rate)
+        requested_channels = self._env_int("SENTINEL_AUDIO_CHANNELS", channels)
+        self.RATE, self.CHANNELS = self._detect_audio_settings(
+            self.card_index,
+            requested_rate=requested_rate,
+            requested_channels=requested_channels,
+        )
 
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def _detect_sample_rate(self, card_index):
-        for rate in [48000, 44100, 32000, 16000, 8000]:
-            try:
-                self.p.is_format_supported(rate,
-                                          input_device=card_index,
-                                          input_channels= self.CHANNELS,
-                                          input_format=pyaudio.paInt16)
-                logging.info(f"✅ Detected sample rate: {rate} Hz")
-                return rate
-            except ValueError:
+    def _env_int(self, name, default=None):
+        value = os.getenv(name)
+        if value in (None, ""):
+            return default
+
+        try:
+            return int(value)
+        except ValueError:
+            logger.warning(f"⚠️ Ignoring invalid integer for {name}: {value!r}")
+            return default
+
+    def _detect_audio_settings(self, card_index, requested_rate=None, requested_channels=None):
+        device_info = self.p.get_device_info_by_index(card_index)
+        max_channels = int(device_info.get("maxInputChannels", 0))
+        default_rate = int(round(device_info.get("defaultSampleRate", 0) or 0))
+
+        if requested_channels is not None:
+            channel_candidates = [requested_channels]
+        elif max_channels >= 2:
+            channel_candidates = [2, 1]
+        else:
+            channel_candidates = [1]
+
+        rate_candidates = []
+        for rate in [requested_rate, default_rate, 48000, 44100, 32000, 16000, 8000]:
+            if rate and rate not in rate_candidates:
+                rate_candidates.append(rate)
+
+        for channels in channel_candidates:
+            if channels < 1 or channels > max_channels:
                 continue
-        raise ValueError("❌ No supported sample rate found for the device.")
+            for rate in rate_candidates:
+                try:
+                    self.p.is_format_supported(
+                        rate,
+                        input_device=card_index,
+                        input_channels=channels,
+                        input_format=pyaudio.paInt16
+                    )
+                    logger.info(
+                        f"✅ Detected audio settings: {rate} Hz, {channels} channel(s)"
+                    )
+                    return rate, channels
+                except ValueError:
+                    continue
+
+        raise ValueError(
+            f"❌ No supported audio format found for device {card_index} "
+            f"({max_channels} input channel(s))."
+        )
 
     def _generate_filename(self):
         return os.path.join(
