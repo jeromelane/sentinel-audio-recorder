@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -21,10 +22,21 @@ def set_uploader(uploader):
 def root():
     return {"message": "Sentinel audio recorder API is running"}
 
+def recording_metadata(path: Path):
+    stat = path.stat()
+    return {
+        "filename": path.name,
+        "size": stat.st_size,
+        "size_bytes": stat.st_size,
+        "created_at": datetime.fromtimestamp(stat.st_ctime, timezone.utc).isoformat().replace("+00:00", "Z"),
+        "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+
 @router.get("/list-recordings")
 def list_recordings():
     files = sorted(RECORDINGS_DIR.glob("*.wav"), key=os.path.getmtime, reverse=True)
-    return {"recordings": [f.name for f in files]}
+    return {"recordings": [recording_metadata(path) for path in files]}
 
 
 @router.get("/download-last")

@@ -42,11 +42,18 @@ def test_list_recordings():
 
 def test_list_recordings_with_fake_files(temp_recordings_dir):
     # Create fake .wav files
-    (temp_recordings_dir / "test1.wav").write_bytes(b"RIFF....WAVEfmt ")
-    (temp_recordings_dir / "test2.wav").write_bytes(b"RIFF....WAVEfmt ")
+    first = temp_recordings_dir / "test1.wav"
+    second = temp_recordings_dir / "test2.wav"
+    first.write_bytes(b"RIFF....WAVEfmt ")
+    second.write_bytes(b"RIFF....WAVEfmt more-data")
 
     data = api.list_recordings()
-    assert sorted(data["recordings"]) == ["test1.wav", "test2.wav"]
+    recordings = sorted(data["recordings"], key=lambda item: item["filename"])
+    assert [item["filename"] for item in recordings] == ["test1.wav", "test2.wav"]
+    assert recordings[0]["size"] == first.stat().st_size
+    assert recordings[0]["size_bytes"] == first.stat().st_size
+    assert recordings[0]["created_at"].endswith("Z")
+    assert recordings[0]["modified_at"].endswith("Z")
 
 def test_download_last_with_fake_file(temp_recordings_dir):
     # Create one fake .wav file
