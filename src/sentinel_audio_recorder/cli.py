@@ -71,6 +71,7 @@ def sync(run_once, watch, url, token, recordings_dir):
     config = UploadConfig.from_env()
     if url:
         config.upload_url = url
+        config.upload_enabled = True
     if token:
         config.upload_token = token
     if recordings_dir:

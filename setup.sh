@@ -40,10 +40,21 @@ EnvironmentFile=-$(pwd)/.env
 ExecStart=$(pwd)/.venv/bin/python $(pwd)/src/sentinel_audio_recorder/run_api.py
 WorkingDirectory=$(pwd)
 Restart=always
+RestartSec=5
 User=$USER
 Group=$USER
 StandardOutput=journal
 StandardError=journal
+
+# Timeout settings to prevent hung processes
+TimeoutStopSec=10
+TimeoutStartSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=512M
 
 [Install]
 WantedBy=multi-user.target

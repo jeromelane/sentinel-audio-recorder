@@ -11,7 +11,7 @@
 - 📦 Automatic virtual environment and dependency setup
 - 🔁 Records on boot using `systemd`
 - 🧪 Easy-to-use CLI for starting/stopping recordings
-- 🌐 Uploads completed recordings to a remote HTTP analyser backend
+- 🌐 Optionally uploads completed recordings to a remote HTTP analyser backend
 - 💾 Tracks upload state in a small local SQLite ledger
 - 🧹 Cleans local storage when disk usage reaches the configured limit
 
@@ -40,17 +40,17 @@ sentinel-audio-recorder start --duration 60
 
 ```
 
-To sync recordings to a remote analyser backend:
+To manually sync recordings to a remote analyser backend:
 
 ```bash
 export SENTINEL_UPLOAD_URL="http://SERVER:8080/ingest-audio/"
-sentinel-audio-recorder sync --once
+sentinel-audio-recorder sync --once --url "$SENTINEL_UPLOAD_URL"
 ```
 
-Use continuous sync to keep uploading and cleaning storage in the background:
+Use continuous manual sync to keep uploading and cleaning storage:
 
 ```bash
-sentinel-audio-recorder sync --watch
+sentinel-audio-recorder sync --watch --url "$SENTINEL_UPLOAD_URL"
 ```
 
 ---
@@ -69,11 +69,11 @@ sentinel-audio-recorder start --trigger
 # Triggered recording with custom silence timeout
 sentinel-audio-recorder start --trigger --threshold 500 --silence-timeout 10
 
-# Run one upload/cleanup pass
+# Run one cleanup-only maintenance pass
 sentinel-audio-recorder sync --once
 
 # Continuously upload and clean local cache
-sentinel-audio-recorder sync --watch
+sentinel-audio-recorder sync --watch --url http://SERVER:8080/ingest-audio/
 
 ```
 
@@ -83,18 +83,20 @@ Recordings are saved in `recordings/` and can be downloaded remotely while they 
 
 ## 🔁 Upload Sync
 
-Upload sync scans `recordings/*.wav` from the filesystem, then uses a local SQLite ledger at `recordings/.upload_state.sqlite` to track upload, retry, and cleanup state.
+Maintenance scans `recordings/*.wav` from the filesystem, then uses a local SQLite ledger at `recordings/.upload_state.sqlite` to track upload, retry, retention, and cleanup state.
 
 Each sync pass:
 
 1. Finds completed `.wav` files in `recordings/`.
-2. Uploads eligible files to `SENTINEL_UPLOAD_URL`.
+2. Uploads eligible files only when automatic upload is explicitly enabled.
 3. Marks successful uploads as `uploaded`.
 4. Records failed uploads and retries them later with backoff.
 5. Checks local disk usage.
 6. Cleans local files only if storage is at or above the configured high-watermark.
 
-Uploaded files are **not deleted immediately**. They remain as a local cache until storage cleanup is needed.
+Automatic upload is **off by default**. Set both `SENTINEL_UPLOAD_ENABLED=1` and `SENTINEL_UPLOAD_URL` to let the background maintenance loop upload recordings. The command-line `sync --url ...` path is treated as an explicit manual upload request.
+
+Uploaded or API-served files are **not deleted immediately**. They receive a local retention window, default `30` days, and remain protected from cleanup until that window expires.
 
 ### Storage Cleanup
 
@@ -103,8 +105,9 @@ Cleanup starts when disk usage reaches `SENTINEL_STORAGE_HIGH_WATERMARK`, defaul
 When cleanup runs:
 
 1. Delete local WAV files smaller than `SENTINEL_SMALL_RECORDING_BYTES`, default `3984588` bytes, about `3.8 MiB`.
-2. If disk usage is still above the high-watermark, delete the oldest local WAV files that have already been uploaded.
-3. Larger unuploaded recordings are preserved.
+2. Skip any file still inside its retention window.
+3. If disk usage is still above the high-watermark, delete the oldest local WAV files that have already been uploaded and are no longer retained.
+4. Larger unuploaded recordings are preserved.
 
 Deleted file history is kept in the SQLite ledger for `SENTINEL_DELETED_RETENTION_DAYS`, default `30`.
 
@@ -113,8 +116,9 @@ Deleted file history is kept in the SQLite ledger for `SENTINEL_DELETED_RETENTIO
 `setup.sh` creates a local `.env` file from `.env.default` if `.env` does not already exist. Edit `.env` with real values for your deployment. The installed systemd service loads this file automatically.
 
 ```bash
-# Required to enable upload
+# URL alone does not enable automatic background upload
 SENTINEL_UPLOAD_URL=http://SERVER:8080/ingest-audio/
+SENTINEL_UPLOAD_ENABLED=0
 
 # Optional bearer token
 SENTINEL_UPLOAD_TOKEN=token
@@ -133,6 +137,7 @@ SENTINEL_UPLOAD_MAX_BACKOFF=3600
 SENTINEL_STORAGE_HIGH_WATERMARK=80
 SENTINEL_SMALL_RECORDING_BYTES=3984588
 SENTINEL_DELETED_RETENTION_DAYS=30
+SENTINEL_UPLOADED_RETENTION_DAYS=30
 ```
 
 ---
@@ -146,4 +151,4 @@ curl http://localhost:8000/download-last
 curl http://localhost:8000/sync-status
 ```
 
-`/sync-status` reports upload configuration, filesystem WAV counts, ledger counts, disk usage, last upload error, and recent cleanup actions.
+`/sync-status` reports upload configuration, filesystem WAV counts, retained files, ledger counts, disk usage, last upload error, and recent cleanup actions.

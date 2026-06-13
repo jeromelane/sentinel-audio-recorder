@@ -4,8 +4,11 @@ import os
 import logging
 import numpy as np
 from datetime import datetime
+from threading import Event, Thread
+from queue import Queue, Empty
 
 logger = logging.getLogger(__name__)
+_shutdown_event = Event()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -143,7 +146,8 @@ class Recorder:
         logger.info(f"✅ Saved: {filename}")
 
     def _open_stream(self):
-        return self.p.open(
+        # Set a timeout of 5 seconds for stream read operations to prevent indefinite hangs
+        stream = self.p.open(
             format=self.FORMAT,
             channels=self.CHANNELS,
             rate=self.RATE,
@@ -151,6 +155,7 @@ class Recorder:
             input_device_index=self.card_index,
             frames_per_buffer=self.CHUNK
         )
+        return stream
 
     def record(self):
         """Main entry point. Delegates to triggered or looped recording."""
@@ -166,19 +171,66 @@ class Recorder:
             logger.info("🎧 Audio interface closed.")
 
     def _record_looped(self):
-        while True:
+        while not _shutdown_event.is_set():
             filename = self._generate_filename()
             logger.info(f"🎙️ Recording to {filename}...")
 
             stream = self._open_stream()
-            frames = self._capture_frames(stream, self.duration)
-            stream.stop_stream()
-            stream.close()
-
-            self._save_wave(filename, frames)
+            try:
+                frames = self._capture_frames(stream, self.duration)
+                self._save_wave(filename, frames)
+            except Exception as e:
+                logger.error(f"❌ Error during recording: {e}")
+            finally:
+                stream.stop_stream()
+                stream.close()
 
             if not self.loop:
                 break
+
+    def _stream_read_with_timeout(self, stream, timeout_seconds=5):
+        """
+        Read from audio stream with timeout protection.
+        Prevents indefinite blocking if USB device becomes unresponsive.
+        
+        Args:
+            stream: PyAudio stream object
+            timeout_seconds: Max time to wait for audio data (default 5s)
+            
+        Returns:
+            Audio chunk or None if timeout occurs
+        """
+        result_queue = Queue()
+        exception_queue = Queue()
+        
+        def read_thread():
+            try:
+                chunk = stream.read(self.CHUNK, exception_on_overflow=False)
+                result_queue.put(chunk)
+            except Exception as e:
+                exception_queue.put(e)
+        
+        thread = Thread(target=read_thread, daemon=True)
+        thread.start()
+        thread.join(timeout=timeout_seconds)
+        
+        # Check if thread finished
+        if thread.is_alive():
+            logger.error(f"❌ Audio stream read timed out after {timeout_seconds}s (device may be unresponsive)")
+            return None
+        
+        # Check for exceptions
+        try:
+            exc = exception_queue.get_nowait()
+            raise exc
+        except Empty:
+            pass
+        
+        # Get the result
+        try:
+            return result_queue.get_nowait()
+        except Empty:
+            return None
 
     def _record_triggered(self):
         logger.info("🕵️ Waiting for sound to trigger recording...")
@@ -190,8 +242,13 @@ class Recorder:
         filename = None
 
         try:
-            while True:
-                chunk = stream.read(self.CHUNK, exception_on_overflow=False)
+            while not _shutdown_event.is_set():
+                chunk = self._stream_read_with_timeout(stream, timeout_seconds=5)
+                
+                if chunk is None:
+                    logger.error("❌ Failed to read audio chunk (timeout or error)")
+                    break
+                    
                 volume = self._compute_rms(chunk)
 
                 if volume > self.threshold:
@@ -227,6 +284,28 @@ class Recorder:
 
     def _capture_frames(self, stream, duration):
         frames = []
-        for _ in range(0, int(self.RATE / self.CHUNK * duration)):
-            frames.append(stream.read(self.CHUNK, exception_on_overflow=False))
+        max_frames = int(self.RATE / self.CHUNK * duration)
+        timeout_count = 0
+        max_timeouts = 3  # Allow 3 consecutive timeouts before giving up
+        
+        for i in range(max_frames):
+            chunk = self._stream_read_with_timeout(stream, timeout_seconds=5)
+            
+            if chunk is None:
+                timeout_count += 1
+                logger.warning(f"Audio read timeout {timeout_count}/{max_timeouts}")
+                
+                if timeout_count >= max_timeouts:
+                    logger.error(f"❌ Too many timeouts, stopping recording")
+                    break
+                continue
+            
+            timeout_count = 0  # Reset on successful read
+            frames.append(chunk)
+            
+            # Check for shutdown
+            if _shutdown_event.is_set():
+                logger.info("🛑 Shutdown requested during frame capture")
+                break
+        
         return frames

@@ -18,6 +18,20 @@ def set_uploader(uploader):
     global UPLOADER
     UPLOADER = uploader
 
+
+def get_uploader():
+    uploader = UPLOADER
+    if uploader is None:
+        config = UploadConfig.from_env()
+        config.recordings_dir = RECORDINGS_DIR
+        uploader = RecordingUploader(config=config)
+    return uploader
+
+
+def mark_recording_served(path: Path):
+    get_uploader().mark_served(path)
+
+
 @router.get("/")
 def root():
     return {"message": "Sentinel audio recorder API is running"}
@@ -52,6 +66,7 @@ def download_last():
         )
     
     latest = files[0]
+    mark_recording_served(latest)
     return FileResponse(
         path=latest,
         filename=latest.name,
@@ -70,6 +85,7 @@ def download_file(filename: str):
             detail="Recording not found or invalid file type"
         )
 
+    mark_recording_served(file_path)
     return FileResponse(
         path=file_path,
         filename=file_path.name,
@@ -79,9 +95,4 @@ def download_file(filename: str):
 
 @router.get("/sync-status")
 def sync_status():
-    uploader = UPLOADER
-    if uploader is None:
-        config = UploadConfig.from_env()
-        config.recordings_dir = RECORDINGS_DIR
-        uploader = RecordingUploader(config=config)
-    return uploader.status()
+    return get_uploader().status()

@@ -9,6 +9,7 @@ import time
 import os
 import sqlite3
 from collections import namedtuple
+from datetime import datetime, timedelta, timezone
 
 
 class FakePyAudio:
@@ -30,6 +31,7 @@ def temp_recordings_dir(monkeypatch):
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
         monkeypatch.setattr(api, "RECORDINGS_DIR", temp_path)
+        monkeypatch.setattr(api, "UPLOADER", None)
         yield temp_path  # Let the test use the path
 
 def test_root():
@@ -122,6 +124,7 @@ class FakeResponse:
 def uploader_config(temp_path, **overrides):
     config = UploadConfig(
         upload_url="http://example.test/ingest-audio/",
+        upload_enabled=True,
         recordings_dir=temp_path,
         min_age_seconds=0,
         retry_base_seconds=1,
@@ -131,6 +134,17 @@ def uploader_config(temp_path, **overrides):
     for key, value in overrides.items():
         setattr(config, key, value)
     return config
+
+
+def test_upload_url_does_not_enable_automatic_upload_by_default(monkeypatch):
+    monkeypatch.setenv("SENTINEL_UPLOAD_URL", "http://example.test/ingest-audio/")
+    monkeypatch.delenv("SENTINEL_UPLOAD_ENABLED", raising=False)
+
+    config = UploadConfig.from_env()
+
+    assert config.configured is True
+    assert config.upload_enabled is False
+    assert config.enabled is False
 
 
 def test_successful_upload_marks_uploaded_without_deleting(temp_recordings_dir):
@@ -153,6 +167,7 @@ def test_successful_upload_marks_uploaded_without_deleting(temp_recordings_dir):
     assert wav.exists()
     assert uploader.is_uploaded(wav)
     assert calls[0][0][0] == "http://example.test/ingest-audio/"
+    assert uploader.is_retained(wav)
 
 
 def test_run_once_discovers_wav_without_existing_db_row(temp_recordings_dir):
@@ -260,6 +275,7 @@ def test_cleanup_deletes_oldest_uploaded_after_small_files(temp_recordings_dir):
             temp_recordings_dir,
             upload_url=None,
             small_recording_bytes=10,
+            uploaded_retention_days=-1,
         ),
         disk_usage=lambda path: next(usage_values),
     )
@@ -292,7 +308,161 @@ def test_cleanup_preserves_larger_unuploaded_recordings(temp_recordings_dir):
 
     assert cleanup["triggered"] is True
     assert cleanup["deleted"] == []
+    assert cleanup["blocked"] is True
     assert wav.exists()
+
+
+def test_cleanup_runs_while_upload_is_disabled(temp_recordings_dir):
+    small = temp_recordings_dir / "small.wav"
+    small.write_bytes(b"x")
+    DiskUsage = namedtuple("usage", "total used free")
+
+    uploader = RecordingUploader(
+        config=uploader_config(
+            temp_recordings_dir,
+            upload_url="http://example.test/ingest-audio/",
+            upload_enabled=False,
+            small_recording_bytes=10,
+        ),
+        disk_usage=lambda path: DiskUsage(total=100, used=90, free=10),
+    )
+
+    result = uploader.run_once()
+
+    assert result["uploaded"] == 0
+    assert result["cleanup"]["triggered"] is True
+    assert not small.exists()
+
+
+def test_retained_uploaded_file_is_preserved_during_cleanup(temp_recordings_dir):
+    wav = temp_recordings_dir / "retained.wav"
+    wav.write_bytes(b"x")
+    DiskUsage = namedtuple("usage", "total used free")
+
+    uploader = RecordingUploader(
+        config=uploader_config(
+            temp_recordings_dir,
+            upload_url=None,
+            small_recording_bytes=10,
+        ),
+        disk_usage=lambda path: DiskUsage(total=100, used=90, free=10),
+    )
+    uploader._record_success(wav, "abc")
+
+    cleanup = uploader.cleanup_storage()
+
+    assert wav.exists()
+    assert cleanup["deleted"] == []
+    assert cleanup["blocked"] is True
+
+
+def test_retained_small_file_preserved_while_non_retained_is_deleted(temp_recordings_dir):
+    retained = temp_recordings_dir / "retained.wav"
+    removable = temp_recordings_dir / "removable.wav"
+    retained.write_bytes(b"x")
+    removable.write_bytes(b"x")
+    DiskUsage = namedtuple("usage", "total used free")
+
+    uploader = RecordingUploader(
+        config=uploader_config(
+            temp_recordings_dir,
+            upload_url=None,
+            small_recording_bytes=10,
+        ),
+        disk_usage=lambda path: DiskUsage(total=100, used=90, free=10),
+    )
+    uploader.mark_served(retained)
+
+    cleanup = uploader.cleanup_storage()
+
+    assert retained.exists()
+    assert not removable.exists()
+    assert cleanup["deleted"][0]["filename"] == "removable.wav"
+
+
+def test_download_marks_file_served_and_retained(temp_recordings_dir):
+    wav = temp_recordings_dir / "served.wav"
+    wav.write_bytes(b"RIFF....WAVEfmt ")
+    uploader = RecordingUploader(
+        config=uploader_config(temp_recordings_dir, upload_url=None)
+    )
+    api.set_uploader(uploader)
+
+    response = api.download_file("served.wav")
+
+    assert response.status_code == 200
+    assert uploader.is_retained(wav)
+    with sqlite3.connect(uploader.config.db_path) as conn:
+        row = conn.execute(
+            "SELECT last_served_at, retained_until FROM uploads WHERE filename = ?",
+            (wav.name,),
+        ).fetchone()
+    assert row[0] is not None
+    assert row[1] is not None
+
+
+def test_expired_retention_allows_cleanup(temp_recordings_dir):
+    wav = temp_recordings_dir / "expired.wav"
+    wav.write_bytes(b"x")
+    DiskUsage = namedtuple("usage", "total used free")
+
+    uploader = RecordingUploader(
+        config=uploader_config(
+            temp_recordings_dir,
+            upload_url=None,
+            small_recording_bytes=10,
+        ),
+        disk_usage=lambda path: DiskUsage(total=100, used=90, free=10),
+    )
+    old_retention = (
+        datetime.now(timezone.utc) - timedelta(days=1)
+    ).isoformat().replace("+00:00", "Z")
+    uploader.mark_served(wav)
+    with sqlite3.connect(uploader.config.db_path) as conn:
+        conn.execute(
+            "UPDATE uploads SET retained_until = ? WHERE filename = ?",
+            (old_retention, wav.name),
+        )
+
+    cleanup = uploader.cleanup_storage()
+
+    assert not wav.exists()
+    assert cleanup["deleted"][0]["filename"] == wav.name
+
+
+def test_existing_upload_database_is_migrated_for_retention_columns(temp_recordings_dir):
+    state_db = temp_recordings_dir / ".upload_state.sqlite"
+    with sqlite3.connect(state_db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE uploads (
+                filename TEXT PRIMARY KEY,
+                size INTEGER NOT NULL,
+                mtime REAL NOT NULL,
+                sha256 TEXT,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_retry_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT,
+                uploaded_at TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    RecordingUploader(
+        config=uploader_config(
+            temp_recordings_dir,
+            upload_url=None,
+            state_db=state_db,
+        )
+    )
+
+    with sqlite3.connect(state_db) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(uploads)")}
+
+    assert "retained_until" in columns
+    assert "last_served_at" in columns
 
 
 def test_prune_deleted_history_after_retention_window(temp_recordings_dir):

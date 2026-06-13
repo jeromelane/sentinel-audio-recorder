@@ -6,7 +6,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 from urllib.parse import urlparse
@@ -23,6 +23,7 @@ DEFAULT_SMALL_RECORDING_BYTES = 3984588
 class UploadConfig:
     upload_url: Optional[str] = None
     upload_token: Optional[str] = None
+    upload_enabled: bool = False
     recordings_dir: Path = DEFAULT_RECORDINGS_DIR
     scan_interval: int = 30
     timeout: int = 60
@@ -32,6 +33,7 @@ class UploadConfig:
     storage_high_watermark: float = 80.0
     small_recording_bytes: int = DEFAULT_SMALL_RECORDING_BYTES
     deleted_retention_days: int = 30
+    uploaded_retention_days: int = 30
     state_db: Optional[Path] = None
 
     @classmethod
@@ -42,6 +44,7 @@ class UploadConfig:
         return cls(
             upload_url=os.getenv("SENTINEL_UPLOAD_URL"),
             upload_token=os.getenv("SENTINEL_UPLOAD_TOKEN"),
+            upload_enabled=_env_bool("SENTINEL_UPLOAD_ENABLED", False),
             recordings_dir=recordings_dir,
             scan_interval=int(os.getenv("SENTINEL_UPLOAD_INTERVAL", "30")),
             timeout=int(os.getenv("SENTINEL_UPLOAD_TIMEOUT", "60")),
@@ -60,10 +63,17 @@ class UploadConfig:
             deleted_retention_days=int(
                 os.getenv("SENTINEL_DELETED_RETENTION_DAYS", "30")
             ),
+            uploaded_retention_days=int(
+                os.getenv("SENTINEL_UPLOADED_RETENTION_DAYS", "30")
+            ),
         )
 
     @property
     def enabled(self) -> bool:
+        return bool(self.upload_enabled and self.upload_url)
+
+    @property
+    def configured(self) -> bool:
         return bool(self.upload_url)
 
     @property
@@ -77,6 +87,13 @@ class UploadConfig:
             return None
         parsed = urlparse(self.upload_url)
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class RecordingUploader:
@@ -111,16 +128,26 @@ class RecordingUploader:
                     next_retry_at REAL NOT NULL DEFAULT 0,
                     last_error TEXT,
                     uploaded_at TEXT,
+                    retained_until TEXT,
+                    last_served_at TEXT,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            self._ensure_column(conn, "retained_until", "TEXT")
+            self._ensure_column(conn, "last_served_at", "TEXT")
+
+    def _ensure_column(self, conn, name: str, column_type: str):
+        rows = conn.execute("PRAGMA table_info(uploads)").fetchall()
+        existing = {row[1] for row in rows}
+        if name not in existing:
+            conn.execute(f"ALTER TABLE uploads ADD COLUMN {name} {column_type}")
 
     def stop(self):
         self._stop_event.set()
 
     def run_forever(self):
-        logger.info("Upload sync loop started.")
+        logger.info("Recording maintenance loop started.")
         while not self._stop_event.is_set():
             self.run_once()
             self._stop_event.wait(self.config.scan_interval)
@@ -140,7 +167,10 @@ class RecordingUploader:
                     self._record_failure(path, str(exc))
                     logger.warning("Upload failed for %s: %s", path, exc)
         else:
-            logger.debug("Upload sync disabled: SENTINEL_UPLOAD_URL is not set.")
+            logger.debug(
+                "Upload disabled: set SENTINEL_UPLOAD_ENABLED=1 and "
+                "SENTINEL_UPLOAD_URL to enable automatic uploads."
+            )
 
         cleanup = self.cleanup_storage()
         return {"uploaded": uploaded, "cleanup": cleanup, "pruned_deleted": pruned}
@@ -160,21 +190,30 @@ class RecordingUploader:
         for path in self._wav_files_oldest_first():
             if path.stat().st_size >= self.config.small_recording_bytes:
                 continue
+            if self.is_retained(path):
+                continue
             deleted.append(self._delete_recording(path, "small_recording"))
 
         for path in self._wav_files_oldest_first():
             if self._disk_percent() < self.config.storage_high_watermark:
                 break
-            if self.is_uploaded(path):
+            if self.is_uploaded(path) and not self.is_retained(path):
                 deleted.append(self._delete_recording(path, "uploaded_cache"))
 
         usage_after = self._disk_percent()
+        blocked = usage_after >= self.config.storage_high_watermark and not deleted
         self._last_cleanup = deleted
         return {
             "triggered": True,
             "usage_before": usage_before,
             "usage_after": usage_after,
             "deleted": deleted,
+            "blocked": blocked,
+            "blocked_reason": (
+                "No non-retained small or uploaded recordings are eligible for cleanup."
+                if blocked
+                else None
+            ),
         }
 
     def status(self) -> Dict[str, object]:
@@ -186,6 +225,7 @@ class RecordingUploader:
             for path in wav_files
             if path.is_file() and path.stat().st_size < self.config.small_recording_bytes
         ]
+        retained_files = [path for path in wav_files if self.is_retained(path)]
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT status, COUNT(*) FROM uploads GROUP BY status"
@@ -198,18 +238,26 @@ class RecordingUploader:
                 "SELECT filename, last_error FROM uploads WHERE last_error IS NOT NULL "
                 "ORDER BY updated_at DESC LIMIT 1"
             ).fetchone()
+            retained = conn.execute(
+                "SELECT retained_until FROM uploads WHERE retained_until IS NOT NULL "
+                "ORDER BY retained_until DESC LIMIT 1"
+            ).fetchone()
 
         counts = {status: count for status, count in rows}
         return {
             "enabled": self.config.enabled,
+            "upload_enabled": self.config.enabled,
+            "upload_configured": self.config.configured,
             "endpoint": self.config.public_endpoint(),
             "recordings_dir": str(self.config.recordings_dir),
             "disk_usage_percent": self._disk_percent(),
             "high_watermark_percent": self.config.storage_high_watermark,
             "small_recording_bytes": self.config.small_recording_bytes,
             "deleted_retention_days": self.config.deleted_retention_days,
+            "uploaded_retention_days": self.config.uploaded_retention_days,
             "filesystem_wav_count": len(wav_files),
             "filesystem_small_wav_count": len(small_files),
+            "filesystem_retained_wav_count": len(retained_files),
             "filesystem_unuploaded_wav_count": sum(
                 1 for path in wav_files if not self.is_uploaded(path)
             ),
@@ -219,6 +267,7 @@ class RecordingUploader:
             "deleted": counts.get("deleted", 0),
             "pruned_deleted": pruned,
             "last_upload_at": last[0] if last else None,
+            "latest_retained_until": retained[0] if retained else None,
             "last_error": {"filename": error[0], "message": error[1]} if error else None,
             "last_cleanup": self._last_cleanup,
         }
@@ -229,6 +278,44 @@ class RecordingUploader:
                 "SELECT status FROM uploads WHERE filename = ?", (path.name,)
             ).fetchone()
         return bool(row and row[0] == "uploaded")
+
+    def is_retained(self, path: Path) -> bool:
+        row = self._get_upload(path)
+        if not row or not row.get("retained_until"):
+            return False
+        retained_until = self._parse_timestamp(row["retained_until"])
+        if retained_until is None:
+            return False
+        return retained_until > datetime.now(timezone.utc)
+
+    def mark_served(self, path: Path):
+        stat = path.stat()
+        timestamp = self._now()
+        retained_until = self._retained_until()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO uploads (
+                    filename, size, mtime, status, retained_until,
+                    last_served_at, updated_at
+                )
+                VALUES (?, ?, ?, 'pending', ?, ?, ?)
+                ON CONFLICT(filename) DO UPDATE SET
+                    size = excluded.size,
+                    mtime = excluded.mtime,
+                    retained_until = excluded.retained_until,
+                    last_served_at = excluded.last_served_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    path.name,
+                    stat.st_size,
+                    stat.st_mtime,
+                    retained_until,
+                    timestamp,
+                    timestamp,
+                ),
+            )
 
     def _eligible_files(self) -> List[Path]:
         now = time.time()
@@ -288,14 +375,16 @@ class RecordingUploader:
     def _record_success(self, path: Path, checksum: str):
         stat = path.stat()
         timestamp = self._now()
+        retained_until = self._retained_until()
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO uploads (
                     filename, size, mtime, sha256, status, attempts,
-                    next_retry_at, last_error, uploaded_at, updated_at
+                    next_retry_at, last_error, uploaded_at, retained_until,
+                    updated_at
                 )
-                VALUES (?, ?, ?, ?, 'uploaded', 0, 0, NULL, ?, ?)
+                VALUES (?, ?, ?, ?, 'uploaded', 0, 0, NULL, ?, ?, ?)
                 ON CONFLICT(filename) DO UPDATE SET
                     size = excluded.size,
                     mtime = excluded.mtime,
@@ -304,9 +393,18 @@ class RecordingUploader:
                     next_retry_at = 0,
                     last_error = NULL,
                     uploaded_at = excluded.uploaded_at,
+                    retained_until = excluded.retained_until,
                     updated_at = excluded.updated_at
                 """,
-                (path.name, stat.st_size, stat.st_mtime, checksum, timestamp, timestamp),
+                (
+                    path.name,
+                    stat.st_size,
+                    stat.st_mtime,
+                    checksum,
+                    timestamp,
+                    retained_until,
+                    timestamp,
+                ),
             )
 
     def _record_failure(self, path: Path, error: str):
@@ -411,3 +509,19 @@ class RecordingUploader:
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _retained_until(self) -> Optional[str]:
+        if self.config.uploaded_retention_days < 0:
+            return None
+        value = datetime.now(timezone.utc) + timedelta(
+            days=self.config.uploaded_retention_days
+        )
+        return value.isoformat().replace("+00:00", "Z")
+
+    def _parse_timestamp(self, value: object) -> Optional[datetime]:
+        if not isinstance(value, str):
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
