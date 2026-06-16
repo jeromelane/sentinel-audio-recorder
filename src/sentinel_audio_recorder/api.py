@@ -1,4 +1,7 @@
 import os
+import logging
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -9,9 +12,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from sentinel_audio_recorder.uploader import RecordingUploader, UploadConfig
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 RECORDINGS_DIR = Path(__file__).resolve().parent.parent.parent / "recordings"
 UPLOADER = None
+_LIST_RECORDINGS_CACHE = {"expires_at": 0.0, "data": None}
+_LIST_RECORDINGS_LOCK = threading.Lock()
 
 
 def set_uploader(uploader):
@@ -32,6 +38,27 @@ def mark_recording_served(path: Path):
     get_uploader().mark_served(path)
 
 
+def _env_float(name, default):
+    value = os.getenv(name)
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning("Invalid float for %s=%r; using %s", name, value, default)
+        return default
+
+
+def _list_recordings_cache_seconds():
+    return max(0.0, _env_float("SENTINEL_LIST_RECORDINGS_CACHE_SECONDS", 2.0))
+
+
+def clear_list_recordings_cache():
+    with _LIST_RECORDINGS_LOCK:
+        _LIST_RECORDINGS_CACHE["expires_at"] = 0.0
+        _LIST_RECORDINGS_CACHE["data"] = None
+
+
 @router.get("/")
 def root():
     return {"message": "Sentinel audio recorder API is running"}
@@ -49,8 +76,35 @@ def recording_metadata(path: Path):
 
 @router.get("/list-recordings")
 def list_recordings():
-    files = sorted(RECORDINGS_DIR.glob("*.wav"), key=os.path.getmtime, reverse=True)
-    return {"recordings": [recording_metadata(path) for path in files]}
+    cache_seconds = _list_recordings_cache_seconds()
+    now = time.monotonic()
+
+    with _LIST_RECORDINGS_LOCK:
+        cached = _LIST_RECORDINGS_CACHE["data"]
+        if cached is not None and now < _LIST_RECORDINGS_CACHE["expires_at"]:
+            return cached
+
+        started_at = time.monotonic()
+        files = sorted(RECORDINGS_DIR.glob("*.wav"), key=os.path.getmtime, reverse=True)
+        response = {"recordings": [recording_metadata(path) for path in files]}
+        elapsed = time.monotonic() - started_at
+
+        logger.info(
+            "Listed %d recordings in %.3fs (cache_ttl=%ss)",
+            len(response["recordings"]),
+            elapsed,
+            cache_seconds,
+        )
+        if elapsed >= 1.0:
+            logger.warning(
+                "Slow /list-recordings response: %.3fs for %d files",
+                elapsed,
+                len(response["recordings"]),
+            )
+
+        _LIST_RECORDINGS_CACHE["data"] = response
+        _LIST_RECORDINGS_CACHE["expires_at"] = now + cache_seconds
+        return response
 
 
 @router.get("/download-last")

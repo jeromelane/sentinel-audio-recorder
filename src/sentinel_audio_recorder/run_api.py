@@ -29,6 +29,14 @@ def _recorder_max_retries():
     return _env_int("SENTINEL_RECORDER_MAX_RETRIES", 5, minimum=1)
 
 
+def _trigger_threshold():
+    return _env_int("SENTINEL_TRIGGER_THRESHOLD", 1500, minimum=1)
+
+
+def _trigger_silence_timeout():
+    return _env_int("SENTINEL_TRIGGER_SILENCE_TIMEOUT", 20, minimum=1)
+
+
 def _env_int(name, default, minimum=None):
     value = os.getenv(name, str(default))
     try:
@@ -77,12 +85,25 @@ def start_background_recording():
     def background_trigger():
         retry_seconds = _recorder_retry_seconds()
         max_retries = _recorder_max_retries()
+        threshold = _trigger_threshold()
+        silence_timeout = _trigger_silence_timeout()
         retry_count = 0
         
         while not _shutdown_event.is_set() and retry_count < max_retries:
             try:
-                logger.info(f"🎙️ Starting background recorder (attempt {retry_count + 1}/{max_retries})...")
-                recorder = Recorder(trigger=True)
+                logger.info(
+                    "🎙️ Starting background recorder "
+                    "(attempt %d/%d, threshold=%d, silence_timeout=%ds)...",
+                    retry_count + 1,
+                    max_retries,
+                    threshold,
+                    silence_timeout,
+                )
+                recorder = Recorder(
+                    trigger=True,
+                    threshold=threshold,
+                    silence_timeout=silence_timeout,
+                )
                 recorder.record()
             except Exception as e:
                 retry_count += 1

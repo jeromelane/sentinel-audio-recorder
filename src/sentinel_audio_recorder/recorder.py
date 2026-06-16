@@ -4,6 +4,7 @@ import os
 import logging
 import numpy as np
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from threading import Event, Thread
@@ -41,6 +42,8 @@ class Recorder:
         self.read_timeout = self._env_float("SENTINEL_AUDIO_READ_TIMEOUT", 5.0)
         self.max_read_timeouts = self._env_int("SENTINEL_AUDIO_MAX_READ_TIMEOUTS", 3)
         self.diagnostics_enabled = self._env_bool("SENTINEL_AUDIO_DIAGNOSTICS", True)
+        self.level_log_interval = self._env_int("SENTINEL_AUDIO_LEVEL_LOG_INTERVAL", 60)
+        self._last_rms = None
 
         self.CHUNK = 1024
         self.FORMAT = pyaudio.paInt16
@@ -282,6 +285,10 @@ class Recorder:
         silence_counter = 0
         timeout_count = 0
         filename = None
+        recording_started_at = None
+        last_level_log_at = time.monotonic()
+        min_volume = None
+        peak_volume = 0.0
 
         try:
             while not _shutdown_event.is_set():
@@ -290,9 +297,17 @@ class Recorder:
                 if chunk is None:
                     timeout_count += 1
                     logger.warning(
-                        "Audio read timeout %d/%d",
+                        "Audio read timeout %d/%d%s",
                         timeout_count,
                         self.max_read_timeouts,
+                        self._active_recording_summary(
+                            recording,
+                            filename,
+                            recording_started_at,
+                            silence_counter,
+                            min_volume,
+                            peak_volume,
+                        ),
                     )
                     if timeout_count >= self.max_read_timeouts:
                         self._raise_audio_timeout()
@@ -301,28 +316,68 @@ class Recorder:
                 timeout_count = 0
                     
                 volume = self._compute_rms(chunk)
+                self._last_rms = volume
 
                 if volume > self.threshold:
                     if not recording:
                         filename = self._generate_filename()
-                        logger.info(f"🎤 Triggered! Started recording to {filename}")
+                        recording_started_at = time.monotonic()
+                        min_volume = volume
+                        peak_volume = volume
+                        last_level_log_at = recording_started_at
+                        logger.info(
+                            "🎤 Triggered! Started recording to %s "
+                            "(rms=%.1f, threshold=%s)",
+                            filename,
+                            volume,
+                            self.threshold,
+                        )
                         frames = []
                         silence_counter = 0
                         recording = True
+                    else:
+                        min_volume = min(min_volume, volume)
+                        peak_volume = max(peak_volume, volume)
 
                     frames.append(chunk)
                     silence_counter = 0
 
                 elif recording:
+                    min_volume = min(min_volume, volume)
+                    peak_volume = max(peak_volume, volume)
                     frames.append(chunk)
                     silence_counter += self.CHUNK / self.RATE
 
                     if silence_counter >= self.silence_timeout:
-                        logger.info(f"📁 Saving after {self.silence_timeout}s of silence.")
+                        logger.info(
+                            "📁 Saving after %ss of silence "
+                            "(duration=%.1fs, last_rms=%.1f, min_rms=%.1f, "
+                            "peak_rms=%.1f, threshold=%s).",
+                            self.silence_timeout,
+                            time.monotonic() - recording_started_at,
+                            volume,
+                            min_volume,
+                            peak_volume,
+                            self.threshold,
+                        )
                         self._save_wave(filename, frames)
                         recording = False
                         frames = []
                         filename = None  # reset for next trigger
+                        recording_started_at = None
+                        min_volume = None
+                        peak_volume = 0.0
+
+                if recording:
+                    last_level_log_at = self._maybe_log_recording_levels(
+                        filename,
+                        recording_started_at,
+                        last_level_log_at,
+                        volume,
+                        silence_counter,
+                        min_volume,
+                        peak_volume,
+                    )
 
         except KeyboardInterrupt:
             logger.info("🛑 Interrupted by user.")
@@ -330,6 +385,56 @@ class Recorder:
                 self._save_wave(filename, frames)
         finally:
             self._close_stream(stream)
+
+    def _active_recording_summary(
+        self,
+        recording,
+        filename,
+        recording_started_at,
+        silence_counter,
+        min_volume,
+        peak_volume,
+    ):
+        if not recording:
+            return ""
+        duration = time.monotonic() - recording_started_at
+        return (
+            f" during active recording filename={filename}, duration={duration:.1f}s, "
+            f"last_rms={self._last_rms}, min_rms={min_volume}, "
+            f"peak_rms={peak_volume}, silence={silence_counter:.1f}s, "
+            f"threshold={self.threshold}"
+        )
+
+    def _maybe_log_recording_levels(
+        self,
+        filename,
+        recording_started_at,
+        last_level_log_at,
+        volume,
+        silence_counter,
+        min_volume,
+        peak_volume,
+    ):
+        if not self.level_log_interval or self.level_log_interval < 1:
+            return last_level_log_at
+
+        now = time.monotonic()
+        if now - last_level_log_at < self.level_log_interval:
+            return last_level_log_at
+
+        logger.info(
+            "Recording levels: filename=%s, duration=%.1fs, last_rms=%.1f, "
+            "min_rms=%.1f, peak_rms=%.1f, silence=%.1fs/%ss, threshold=%s",
+            filename,
+            now - recording_started_at,
+            volume,
+            min_volume,
+            peak_volume,
+            silence_counter,
+            self.silence_timeout,
+            self.threshold,
+        )
+        return now
 
 
     def _capture_frames(self, stream, duration):

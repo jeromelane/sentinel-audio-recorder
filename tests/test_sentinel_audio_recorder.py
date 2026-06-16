@@ -1,5 +1,6 @@
 import pytest
 from pathlib import Path
+from sentinel_audio_recorder import run_api
 from sentinel_audio_recorder import api
 from sentinel_audio_recorder.env import load_env_file
 import requests
@@ -33,7 +34,9 @@ def temp_recordings_dir(monkeypatch):
         temp_path = Path(temp_dir)
         monkeypatch.setattr(api, "RECORDINGS_DIR", temp_path)
         monkeypatch.setattr(api, "UPLOADER", None)
+        api.clear_list_recordings_cache()
         yield temp_path  # Let the test use the path
+        api.clear_list_recordings_cache()
 
 def test_root():
     response = api.root()
@@ -57,6 +60,20 @@ def test_list_recordings_with_fake_files(temp_recordings_dir):
     assert recordings[0]["size_bytes"] == first.stat().st_size
     assert recordings[0]["created_at"].endswith("Z")
     assert recordings[0]["modified_at"].endswith("Z")
+
+
+def test_list_recordings_uses_short_cache(temp_recordings_dir, monkeypatch):
+    monkeypatch.setenv("SENTINEL_LIST_RECORDINGS_CACHE_SECONDS", "60")
+    first = temp_recordings_dir / "test1.wav"
+    second = temp_recordings_dir / "test2.wav"
+    first.write_bytes(b"RIFF....WAVEfmt ")
+
+    first_response = api.list_recordings()
+    second.write_bytes(b"RIFF....WAVEfmt ")
+    cached_response = api.list_recordings()
+
+    assert first_response == cached_response
+    assert [item["filename"] for item in cached_response["recordings"]] == ["test1.wav"]
 
 def test_download_last_with_fake_file(temp_recordings_dir):
     # Create one fake .wav file
@@ -106,6 +123,14 @@ def test_env_bool_parses_disabled_value(monkeypatch):
     monkeypatch.setenv("SENTINEL_AUDIO_DIAGNOSTICS", "0")
 
     assert recorder._env_bool("SENTINEL_AUDIO_DIAGNOSTICS", True) is False
+
+
+def test_background_trigger_settings_from_env(monkeypatch):
+    monkeypatch.setenv("SENTINEL_TRIGGER_THRESHOLD", "3000")
+    monkeypatch.setenv("SENTINEL_TRIGGER_SILENCE_TIMEOUT", "30")
+
+    assert run_api._trigger_threshold() == 3000
+    assert run_api._trigger_silence_timeout() == 30
 
 
 def test_capture_frames_raises_after_repeated_audio_timeouts():
