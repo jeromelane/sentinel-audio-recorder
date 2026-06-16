@@ -1,9 +1,7 @@
 import threading
 import os
 import logging
-import time
 import signal
-import sys
 
 import uvicorn
 from fastapi import FastAPI
@@ -24,15 +22,29 @@ load_env_file()
 
 
 def _recorder_retry_seconds():
-    value = os.getenv("SENTINEL_RECORDER_RETRY_SECONDS", "30")
+    return _env_int("SENTINEL_RECORDER_RETRY_SECONDS", 30, minimum=1)
+
+
+def _recorder_max_retries():
+    return _env_int("SENTINEL_RECORDER_MAX_RETRIES", 5, minimum=1)
+
+
+def _env_int(name, default, minimum=None):
+    value = os.getenv(name, str(default))
     try:
-        return max(1, int(value))
+        parsed = int(value)
     except ValueError:
         logger.warning(
-            "Invalid SENTINEL_RECORDER_RETRY_SECONDS=%r; using 30 seconds",
+            "Invalid %s=%r; using %s",
+            name,
             value,
+            default,
         )
-        return 30
+        return default
+    if minimum is not None and parsed < minimum:
+        logger.warning("%s=%s is too low; using %s", name, parsed, minimum)
+        return minimum
+    return parsed
 
 
 def shutdown_handler(signum, frame):
@@ -41,7 +53,6 @@ def shutdown_handler(signum, frame):
     _shutdown_event.set()
     if uploader:
         uploader.stop()
-    sys.exit(0)
 
 
 signal.signal(signal.SIGTERM, shutdown_handler)
@@ -50,6 +61,8 @@ signal.signal(signal.SIGINT, shutdown_handler)
 @app.on_event("startup")
 def start_background_recording():
     global upload_thread, uploader, recorder_thread
+
+    _shutdown_event.clear()
 
     config = UploadConfig.from_env()
     uploader = RecordingUploader(config=config)
@@ -63,7 +76,7 @@ def start_background_recording():
 
     def background_trigger():
         retry_seconds = _recorder_retry_seconds()
-        max_retries = 5
+        max_retries = _recorder_max_retries()
         retry_count = 0
         
         while not _shutdown_event.is_set() and retry_count < max_retries:
@@ -71,7 +84,6 @@ def start_background_recording():
                 logger.info(f"🎙️ Starting background recorder (attempt {retry_count + 1}/{max_retries})...")
                 recorder = Recorder(trigger=True)
                 recorder.record()
-                retry_count = 0  # Reset on successful start
             except Exception as e:
                 retry_count += 1
                 logger.exception(
@@ -90,6 +102,13 @@ def start_background_recording():
 
     recorder_thread = threading.Thread(target=background_trigger, daemon=True)
     recorder_thread.start()
+
+
+@app.on_event("shutdown")
+def stop_background_workers():
+    _shutdown_event.set()
+    if uploader:
+        uploader.stop()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

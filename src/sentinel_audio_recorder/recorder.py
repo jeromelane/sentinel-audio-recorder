@@ -36,6 +36,8 @@ class Recorder:
         self.trigger = trigger
         self.threshold = threshold
         self.silence_timeout = silence_timeout
+        self.read_timeout = self._env_float("SENTINEL_AUDIO_READ_TIMEOUT", 5.0)
+        self.max_read_timeouts = self._env_int("SENTINEL_AUDIO_MAX_READ_TIMEOUTS", 3)
 
         self.CHUNK = 1024
         self.FORMAT = pyaudio.paInt16
@@ -58,6 +60,17 @@ class Recorder:
             return int(value)
         except ValueError:
             logger.warning(f"⚠️ Ignoring invalid integer for {name}: {value!r}")
+            return default
+
+    def _env_float(self, name, default=None):
+        value = os.getenv(name)
+        if value in (None, ""):
+            return default
+
+        try:
+            return float(value)
+        except ValueError:
+            logger.warning(f"⚠️ Ignoring invalid float for {name}: {value!r}")
             return default
 
     def _detect_audio_settings(self, card_index, requested_rate=None, requested_channels=None):
@@ -178,17 +191,23 @@ class Recorder:
             stream = self._open_stream()
             try:
                 frames = self._capture_frames(stream, self.duration)
-                self._save_wave(filename, frames)
+                if frames:
+                    self._save_wave(filename, frames)
+                else:
+                    logger.warning("No audio frames captured; skipping empty recording.")
+            except AudioReadTimeout:
+                logger.exception("Audio device stopped responding during recording.")
+                raise
             except Exception as e:
                 logger.error(f"❌ Error during recording: {e}")
+                raise
             finally:
-                stream.stop_stream()
-                stream.close()
+                self._close_stream(stream)
 
             if not self.loop:
                 break
 
-    def _stream_read_with_timeout(self, stream, timeout_seconds=5):
+    def _stream_read_with_timeout(self, stream, timeout_seconds=None):
         """
         Read from audio stream with timeout protection.
         Prevents indefinite blocking if USB device becomes unresponsive.
@@ -210,6 +229,7 @@ class Recorder:
             except Exception as e:
                 exception_queue.put(e)
         
+        timeout_seconds = timeout_seconds or self.read_timeout
         thread = Thread(target=read_thread, daemon=True)
         thread.start()
         thread.join(timeout=timeout_seconds)
@@ -239,15 +259,25 @@ class Recorder:
         recording = False
         frames = []
         silence_counter = 0
+        timeout_count = 0
         filename = None
 
         try:
             while not _shutdown_event.is_set():
-                chunk = self._stream_read_with_timeout(stream, timeout_seconds=5)
+                chunk = self._stream_read_with_timeout(stream)
                 
                 if chunk is None:
-                    logger.error("❌ Failed to read audio chunk (timeout or error)")
-                    break
+                    timeout_count += 1
+                    logger.warning(
+                        "Audio read timeout %d/%d",
+                        timeout_count,
+                        self.max_read_timeouts,
+                    )
+                    if timeout_count >= self.max_read_timeouts:
+                        raise AudioReadTimeout("Audio device stopped responding.")
+                    continue
+
+                timeout_count = 0
                     
                 volume = self._compute_rms(chunk)
 
@@ -278,26 +308,27 @@ class Recorder:
             if recording and frames:
                 self._save_wave(filename, frames)
         finally:
-            stream.stop_stream()
-            stream.close()
+            self._close_stream(stream)
 
 
     def _capture_frames(self, stream, duration):
         frames = []
         max_frames = int(self.RATE / self.CHUNK * duration)
         timeout_count = 0
-        max_timeouts = 3  # Allow 3 consecutive timeouts before giving up
         
         for i in range(max_frames):
-            chunk = self._stream_read_with_timeout(stream, timeout_seconds=5)
+            chunk = self._stream_read_with_timeout(stream)
             
             if chunk is None:
                 timeout_count += 1
-                logger.warning(f"Audio read timeout {timeout_count}/{max_timeouts}")
+                logger.warning(
+                    "Audio read timeout %d/%d",
+                    timeout_count,
+                    self.max_read_timeouts,
+                )
                 
-                if timeout_count >= max_timeouts:
-                    logger.error(f"❌ Too many timeouts, stopping recording")
-                    break
+                if timeout_count >= self.max_read_timeouts:
+                    raise AudioReadTimeout("Audio device stopped responding.")
                 continue
             
             timeout_count = 0  # Reset on successful read
@@ -309,3 +340,17 @@ class Recorder:
                 break
         
         return frames
+
+    def _close_stream(self, stream):
+        try:
+            stream.stop_stream()
+        except Exception:
+            logger.debug("Audio stream stop failed during cleanup.", exc_info=True)
+        try:
+            stream.close()
+        except Exception:
+            logger.debug("Audio stream close failed during cleanup.", exc_info=True)
+
+
+class AudioReadTimeout(RuntimeError):
+    """Raised when the audio input stops returning data."""

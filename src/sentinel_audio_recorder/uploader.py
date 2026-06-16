@@ -27,6 +27,7 @@ class UploadConfig:
     recordings_dir: Path = DEFAULT_RECORDINGS_DIR
     scan_interval: int = 30
     timeout: int = 60
+    max_attempts: int = 5
     min_age_seconds: int = 10
     retry_base_seconds: int = 30
     retry_max_seconds: int = 3600
@@ -46,25 +47,33 @@ class UploadConfig:
             upload_token=os.getenv("SENTINEL_UPLOAD_TOKEN"),
             upload_enabled=_env_bool("SENTINEL_UPLOAD_ENABLED", False),
             recordings_dir=recordings_dir,
-            scan_interval=int(os.getenv("SENTINEL_UPLOAD_INTERVAL", "30")),
-            timeout=int(os.getenv("SENTINEL_UPLOAD_TIMEOUT", "60")),
-            min_age_seconds=int(os.getenv("SENTINEL_UPLOAD_MIN_AGE", "10")),
-            retry_base_seconds=int(os.getenv("SENTINEL_UPLOAD_RETRY_BASE", "30")),
-            retry_max_seconds=int(os.getenv("SENTINEL_UPLOAD_MAX_BACKOFF", "3600")),
-            storage_high_watermark=float(
-                os.getenv("SENTINEL_STORAGE_HIGH_WATERMARK", "80")
+            scan_interval=_env_int("SENTINEL_UPLOAD_INTERVAL", 30, minimum=1),
+            timeout=_env_int("SENTINEL_UPLOAD_TIMEOUT", 60, minimum=1),
+            max_attempts=_env_int("SENTINEL_UPLOAD_MAX_ATTEMPTS", 5, minimum=1),
+            min_age_seconds=_env_int("SENTINEL_UPLOAD_MIN_AGE", 10, minimum=0),
+            retry_base_seconds=_env_int("SENTINEL_UPLOAD_RETRY_BASE", 30, minimum=1),
+            retry_max_seconds=_env_int(
+                "SENTINEL_UPLOAD_MAX_BACKOFF",
+                3600,
+                minimum=1,
             ),
-            small_recording_bytes=int(
-                os.getenv(
-                    "SENTINEL_SMALL_RECORDING_BYTES",
-                    str(DEFAULT_SMALL_RECORDING_BYTES),
-                )
+            storage_high_watermark=_env_float(
+                "SENTINEL_STORAGE_HIGH_WATERMARK",
+                80.0,
+                minimum=0.0,
             ),
-            deleted_retention_days=int(
-                os.getenv("SENTINEL_DELETED_RETENTION_DAYS", "30")
+            small_recording_bytes=_env_int(
+                "SENTINEL_SMALL_RECORDING_BYTES",
+                DEFAULT_SMALL_RECORDING_BYTES,
+                minimum=0,
             ),
-            uploaded_retention_days=int(
-                os.getenv("SENTINEL_UPLOADED_RETENTION_DAYS", "30")
+            deleted_retention_days=_env_int(
+                "SENTINEL_DELETED_RETENTION_DAYS",
+                30,
+            ),
+            uploaded_retention_days=_env_int(
+                "SENTINEL_UPLOADED_RETENTION_DAYS",
+                30,
             ),
         )
 
@@ -87,6 +96,36 @@ class UploadConfig:
             return None
         parsed = urlparse(self.upload_url)
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+
+def _env_int(name: str, default: int, minimum: Optional[int] = None) -> int:
+    value = os.getenv(name)
+    if value in (None, ""):
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; using %s", name, value, default)
+        return default
+    if minimum is not None and parsed < minimum:
+        logger.warning("%s=%s is too low; using %s", name, parsed, minimum)
+        return minimum
+    return parsed
+
+
+def _env_float(name: str, default: float, minimum: Optional[float] = None) -> float:
+    value = os.getenv(name)
+    if value in (None, ""):
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        logger.warning("Invalid float for %s=%r; using %s", name, value, default)
+        return default
+    if minimum is not None and parsed < minimum:
+        logger.warning("%s=%s is too low; using %s", name, parsed, minimum)
+        return minimum
+    return parsed
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -163,6 +202,15 @@ class RecordingUploader:
                 try:
                     self._upload_file(path)
                     uploaded += 1
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                    self._record_failure(path, str(exc))
+                    logger.warning(
+                        "Upload endpoint unreachable for %s: %s. "
+                        "Pausing remaining uploads until next scan.",
+                        path,
+                        exc,
+                    )
+                    break
                 except Exception as exc:
                     self._record_failure(path, str(exc))
                     logger.warning("Upload failed for %s: %s", path, exc)
@@ -338,6 +386,8 @@ class RecordingUploader:
         row = self._get_upload(path)
         now = time.time()
         if row and row["status"] == "uploaded":
+            return False
+        if row and int(row["attempts"]) >= self.config.max_attempts:
             return False
         if row and row["next_retry_at"] > now:
             return False

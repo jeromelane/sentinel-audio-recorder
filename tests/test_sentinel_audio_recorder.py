@@ -2,7 +2,8 @@ import pytest
 from pathlib import Path
 from sentinel_audio_recorder import api
 from sentinel_audio_recorder.env import load_env_file
-from sentinel_audio_recorder.recorder import Recorder
+import requests
+from sentinel_audio_recorder.recorder import AudioReadTimeout, Recorder
 from sentinel_audio_recorder.uploader import RecordingUploader, UploadConfig
 import tempfile
 import time
@@ -98,6 +99,17 @@ def test_env_int_ignores_invalid_values(monkeypatch):
     monkeypatch.setenv("SENTINEL_AUDIO_CHANNELS", "nope")
 
     assert recorder._env_int("SENTINEL_AUDIO_CHANNELS", 2) == 2
+
+
+def test_capture_frames_raises_after_repeated_audio_timeouts():
+    recorder = Recorder.__new__(Recorder)
+    recorder.RATE = 48000
+    recorder.CHUNK = 1024
+    recorder.max_read_timeouts = 2
+    recorder._stream_read_with_timeout = lambda stream: None
+
+    with pytest.raises(AudioReadTimeout):
+        recorder._capture_frames(object(), 1)
 
 
 def test_load_env_file_sets_missing_values_only(tmp_path, monkeypatch):
@@ -207,6 +219,49 @@ def test_failed_upload_retries_without_deleting(temp_recordings_dir):
     assert wav.exists()
     assert status["failed"] == 1
     assert status["last_error"]["message"] == "network down"
+
+
+def test_upload_stops_after_max_attempts(temp_recordings_dir):
+    wav = temp_recordings_dir / "recording.wav"
+    wav.write_bytes(b"RIFF....WAVEfmt ")
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise RuntimeError("server down")
+
+    uploader = RecordingUploader(
+        config=uploader_config(temp_recordings_dir, max_attempts=1),
+        request_post=fake_post,
+    )
+
+    uploader.run_once()
+    uploader.run_once()
+
+    assert len(calls) == 1
+    assert wav.exists()
+
+
+def test_upload_pauses_scan_when_endpoint_times_out(temp_recordings_dir):
+    first = temp_recordings_dir / "first.wav"
+    second = temp_recordings_dir / "second.wav"
+    first.write_bytes(b"RIFF....WAVEfmt ")
+    second.write_bytes(b"RIFF....WAVEfmt ")
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise requests.exceptions.ConnectTimeout("server timed out")
+
+    uploader = RecordingUploader(
+        config=uploader_config(temp_recordings_dir),
+        request_post=fake_post,
+    )
+
+    result = uploader.run_once()
+
+    assert result["uploaded"] == 0
+    assert len(calls) == 1
 
 
 def test_cleanup_below_watermark_deletes_nothing(temp_recordings_dir):
