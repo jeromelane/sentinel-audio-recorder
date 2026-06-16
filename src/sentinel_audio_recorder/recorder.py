@@ -3,7 +3,9 @@ import wave
 import os
 import logging
 import numpy as np
+import subprocess
 from datetime import datetime
+from pathlib import Path
 from threading import Event, Thread
 from queue import Queue, Empty
 
@@ -38,6 +40,7 @@ class Recorder:
         self.silence_timeout = silence_timeout
         self.read_timeout = self._env_float("SENTINEL_AUDIO_READ_TIMEOUT", 5.0)
         self.max_read_timeouts = self._env_int("SENTINEL_AUDIO_MAX_READ_TIMEOUTS", 3)
+        self.diagnostics_enabled = self._env_bool("SENTINEL_AUDIO_DIAGNOSTICS", True)
 
         self.CHUNK = 1024
         self.FORMAT = pyaudio.paInt16
@@ -50,6 +53,7 @@ class Recorder:
         )
 
         os.makedirs(self.output_dir, exist_ok=True)
+        self._log_audio_diagnostics("recorder initialized")
 
     def _env_int(self, name, default=None):
         value = os.getenv(name)
@@ -72,6 +76,12 @@ class Recorder:
         except ValueError:
             logger.warning(f"⚠️ Ignoring invalid float for {name}: {value!r}")
             return default
+
+    def _env_bool(self, name, default=False):
+        value = os.getenv(name)
+        if value in (None, ""):
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
 
     def _detect_audio_settings(self, card_index, requested_rate=None, requested_channels=None):
         device_info = self.p.get_device_info_by_index(card_index)
@@ -207,6 +217,10 @@ class Recorder:
             if not self.loop:
                 break
 
+    def _raise_audio_timeout(self):
+        self._log_audio_diagnostics("audio read timeouts exceeded")
+        raise AudioReadTimeout("Audio device stopped responding.")
+
     def _stream_read_with_timeout(self, stream, timeout_seconds=None):
         """
         Read from audio stream with timeout protection.
@@ -236,7 +250,14 @@ class Recorder:
         
         # Check if thread finished
         if thread.is_alive():
-            logger.error(f"❌ Audio stream read timed out after {timeout_seconds}s (device may be unresponsive)")
+            logger.error(
+                "❌ Audio stream read timed out after %ss "
+                "(device may be unresponsive; card_index=%s, rate=%s, channels=%s)",
+                timeout_seconds,
+                self.card_index,
+                self.RATE,
+                self.CHANNELS,
+            )
             return None
         
         # Check for exceptions
@@ -274,7 +295,7 @@ class Recorder:
                         self.max_read_timeouts,
                     )
                     if timeout_count >= self.max_read_timeouts:
-                        raise AudioReadTimeout("Audio device stopped responding.")
+                        self._raise_audio_timeout()
                     continue
 
                 timeout_count = 0
@@ -328,7 +349,7 @@ class Recorder:
                 )
                 
                 if timeout_count >= self.max_read_timeouts:
-                    raise AudioReadTimeout("Audio device stopped responding.")
+                    self._raise_audio_timeout()
                 continue
             
             timeout_count = 0  # Reset on successful read
@@ -350,6 +371,97 @@ class Recorder:
             stream.close()
         except Exception:
             logger.debug("Audio stream close failed during cleanup.", exc_info=True)
+
+    def _log_audio_diagnostics(self, reason):
+        if not getattr(self, "diagnostics_enabled", False):
+            return
+
+        logger.info(
+            "Audio diagnostics (%s): card_index=%s, rate=%s, channels=%s, "
+            "chunk=%s, read_timeout=%s, max_read_timeouts=%s",
+            reason,
+            self.card_index,
+            self.RATE,
+            self.CHANNELS,
+            self.CHUNK,
+            self.read_timeout,
+            self.max_read_timeouts,
+        )
+        self._log_selected_device()
+        self._log_input_devices()
+        self._log_text_file("/proc/asound/cards", "ALSA cards")
+        self._log_text_file("/proc/asound/devices", "ALSA devices")
+        self._log_text_file("/proc/asound/pcm", "ALSA PCM devices")
+        self._log_text_file("/proc/device-tree/model", "Pi model")
+        self._log_command(["vcgencmd", "get_throttled"], "Pi throttling")
+        self._log_command(["lsusb"], "USB devices")
+
+    def _log_selected_device(self):
+        try:
+            info = self.p.get_device_info_by_index(self.card_index)
+        except Exception as exc:
+            logger.warning("Audio diagnostics: selected device lookup failed: %s", exc)
+            return
+        logger.info("Audio diagnostics: selected PyAudio device: %s", info)
+
+    def _log_input_devices(self):
+        try:
+            devices = []
+            for index in range(self.p.get_device_count()):
+                info = self.p.get_device_info_by_index(index)
+                if int(info.get("maxInputChannels", 0)) > 0:
+                    devices.append(
+                        {
+                            "index": index,
+                            "name": info.get("name"),
+                            "maxInputChannels": info.get("maxInputChannels"),
+                            "defaultSampleRate": info.get("defaultSampleRate"),
+                        }
+                    )
+        except Exception as exc:
+            logger.warning("Audio diagnostics: input device listing failed: %s", exc)
+            return
+        logger.info("Audio diagnostics: input devices: %s", devices)
+
+    def _log_text_file(self, path, label):
+        try:
+            text = Path(path).read_text(errors="replace").replace("\x00", "").strip()
+        except FileNotFoundError:
+            logger.debug("Audio diagnostics: %s unavailable at %s", label, path)
+            return
+        except Exception as exc:
+            logger.warning("Audio diagnostics: failed reading %s: %s", path, exc)
+            return
+
+        if len(text) > 4000:
+            text = text[:4000] + "...<truncated>"
+        logger.info("Audio diagnostics: %s:\n%s", label, text or "<empty>")
+
+    def _log_command(self, command, label):
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except FileNotFoundError:
+            logger.debug("Audio diagnostics: %s command not found: %s", label, command[0])
+            return
+        except Exception as exc:
+            logger.warning("Audio diagnostics: %s command failed: %s", label, exc)
+            return
+
+        output = (result.stdout + result.stderr).strip()
+        if len(output) > 4000:
+            output = output[:4000] + "...<truncated>"
+        logger.info(
+            "Audio diagnostics: %s exit=%s:\n%s",
+            label,
+            result.returncode,
+            output or "<empty>",
+        )
 
 
 class AudioReadTimeout(RuntimeError):

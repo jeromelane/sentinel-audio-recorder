@@ -101,6 +101,13 @@ def test_env_int_ignores_invalid_values(monkeypatch):
     assert recorder._env_int("SENTINEL_AUDIO_CHANNELS", 2) == 2
 
 
+def test_env_bool_parses_disabled_value(monkeypatch):
+    recorder = Recorder.__new__(Recorder)
+    monkeypatch.setenv("SENTINEL_AUDIO_DIAGNOSTICS", "0")
+
+    assert recorder._env_bool("SENTINEL_AUDIO_DIAGNOSTICS", True) is False
+
+
 def test_capture_frames_raises_after_repeated_audio_timeouts():
     recorder = Recorder.__new__(Recorder)
     recorder.RATE = 48000
